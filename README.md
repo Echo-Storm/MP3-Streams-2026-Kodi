@@ -25,7 +25,7 @@
 
 <hr>
 
-<h2>Changes v2026.1</h2>
+<h2>Changes v2026.1 / 2026.1.1</h2>
 
 <h3>Fixes</h3>
 
