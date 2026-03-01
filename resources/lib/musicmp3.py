@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 #
 # Copyright (C) 2019 L2501
-# v2026.1: feature update and efficiency pass
-# v2026.2: favourites system; richer album metadata; fanart on Now Playing.
-# v2026.3: stability pass
+# v2026.1–v2026.2: feature updates, session handling, favourites, richer metadata
+#   by L2501 / MP3 Streams project
+# v2026.3: stability pass, session resilience, cache poison protection
+#   by Echostorm / Claude
+# MP3 Streams Echoed
 #
 # v2026.3 changes:
 #
