@@ -103,3 +103,64 @@ page_size and request_timeout are now real settings in the Settings dialog inste
 <p>
 The song search bug I discovered after writing has been fixed:  the search results page uses song__name--search, song__artist--search, song__album--search CSS classes — not the itemprop meta tags the parser was looking for. It was hitting the guard check on line 335, silently continuing past every row, and returning an empty list every time. Song search would have appeared to work (no crash, keyboard dialog would close) but the list would always come up empty. That's now fixed in 2026.1.1.
 </p>
+
+ 1.3:
+ Bug 1 — Double text: The old code set the ListItem label to "Title[CR][COLOR=darkmagenta]Artist[/COLOR]" AND populated setInfo() with title/artist. Kodi 19 renders both — the hand-crafted label string and the music info labels — giving you the purple/white double display. The fix removes the [CR][COLOR] concatenation from every album listing; the label is now just the plain title, and Kodi renders artist/year from setInfo automatically in whatever skin format it prefers.
+Bug 2 — RoutingError on album URLs: quote(url) only encodes : to %3A but leaves / as-is, so the URL https%3A//musicmp3.ru/artist.../album...html became extra path segments that didn't match any route. The fix moves all link-passing to query string parameters instead of path segments — plugin.url_for(musicmp3_album) + "?link=" + quote(link, safe="") where safe="" encodes everything including /. The _link_url() and _get_link() helpers handle this cleanly for all three affected routes (musicmp3_album, artists_albums, and search results).
+ 
+ 
+ 
+ v2026.1.5 — here's what changed and why:
+Play routing fixed (track_id/rel): The old @plugin.route("/musicmp3/play/<track_id>/<rel>") was a latent routing bug — rel is a filename like artist_song.mp3 and .mp3 can confuse the routing library's path matching. Now uses query string params just like the link fix, so there's no ambiguity.
+Session refresh is now unconditional: _ensure_session() was previously a no-op if SessionId was already in the cookie jar. But a saved cookie can be stale — the server-side session may be gone even if the cookie file has a value. Now it always does a fresh GET before computing the CDN token.
+Album URL passed through to play: The album page URL is now stored in the Track DB row (album_url field) and passed to play_url() at play time. The site GET is made to the actual album page rather than just the base URL — this matters because the CDN token may be scoped to a session established on that specific album page.
+Buffer hint added: li.setProperty("BufferingMode", "1") tells Kodi to pre-buffer before starting playback rather than playing immediately and potentially failing on the first frames.
+addon.xml version bumped to 2026.1.5 to match the zip name. 
+
+v2026.1.6 — the log made the actual bug obvious once I looked carefully at the CDN URLs.
+The Referer bug: The pipe string Kodi uses to open the CDN URL was sending Referer=https://musicmp3.ru/ (the site root). But the CDN validates that requests come from a legitimate album page — the browser always sends the album page URL as the referer when playing music. So every request was being rejected with 404. The fix passes album_url (e.g. https://musicmp3.ru/artist_megadeth__album_megadeth.html) as the Referer instead.
+InfoTagMusic: Switched musicmp3_play() from the deprecated setInfo("music", {...}) to the Kodi 19+ getMusicInfoTag() setters, which eliminates the spam of deprecation warnings in the log.
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 1.3
