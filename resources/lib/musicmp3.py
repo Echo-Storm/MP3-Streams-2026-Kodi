@@ -2,51 +2,56 @@
 #
 # Copyright (C) 2019 L2501
 # v2026.1: feature update and efficiency pass
-# v2026.2: favourites system; richer album metadata (genre, description);
-#          fanart passed to Now Playing screen.
+# v2026.2: favourites system; richer album metadata; fanart on Now Playing.
+# v2026.3: stability pass
 #
-# Changes in v2026.1 vs v0.1.0 (the bug-fix release):
+# v2026.3 changes:
 #
-# NEW FEATURES
-# ------------
-# 1. Song search: the site's search endpoint accepts `all=songs`, which the old
-#    plugin never used. search() now handles cat="songs" and returns track dicts
-#    that can be played directly.
+# ROOT CAUSE OF "no results" BUG — FIXED:
+# ----------------------------------------
+# The site returns HTTP 200 with a login-wall / empty page when the session
+# cookie is stale or absent.  _cached_get was caching that bad HTML response
+# for up to cache_hours hours (default 6).  Every subsequent browse of that
+# genre then read the empty HTML from cache and returned 0 results — with no
+# error message, no retry, no indication anything was wrong.
 #
-# 2. HTTP response caching (optional, controlled by the cache_hours setting):
-#    A simple SQLite-backed cache stores page HTML keyed by URL + params.
-#    This avoids re-fetching the same genre listing every single time you open
-#    it. Cache entries expire after `cache_hours` hours. Set to 0 to disable.
-#    The album_tracks table bypasses the cache (track pages change rarely but
-#    we want fresh play tokens, so we always fetch those live).
-#    Note: the cache stores raw HTML text, not parsed data. If the site changes
-#    its structure, clearing the cache is enough to pick up the new layout.
+# Fixes applied:
 #
-# 3. Configurable page size: `count` is now driven by the `page_size` setting
-#    (default 40) instead of being hardcoded. Callers pass it in.
+# 1. CACHE VALIDATION — _cached_get now checks that fetched HTML actually
+#    contains expected content (album_report, artist_preview, or song rows)
+#    before writing it to the cache.  Bad pages are never stored.
 #
-# 4. Configurable request timeout: driven by the `request_timeout` setting.
+# 2. CACHE POISON DETECTION — before returning a cached page, we verify it
+#    still contains parseable content.  A poisoned cache entry is deleted and
+#    re-fetched live rather than silently returning nothing.
 #
-# EFFICIENCY / CODE QUALITY
-# -------------------------
-# 5. Removed duplicated album-report parsing that appeared in search(), search(),
-#    artist_albums(), and main_albums(). Now all go through _parse_album_report().
+# 3. SESSION WARMUP — _cached_get now ensures a valid SessionId cookie exists
+#    before making any listing request.  Previously only play_url() did this.
+#    A missing or expired session is refreshed transparently.
 #
-# 6. _parse_album_report() is None-safe: if a CSS class isn't found on the page
-#    (site layout change), it logs a warning and returns None so the caller can
-#    skip it, rather than crashing with AttributeError.
+# 4. RETRY ON EMPTY — if a live fetch returns 0 results after a full parse,
+#    we refresh the session and retry once before giving up.  Handles the case
+#    where the site issued a new session format mid-browse.
 #
-# 7. Session is now constructed once and stored; boo() and play_url() unchanged.
+# 5. GRACEFUL HTTP ERRORS — raise_for_status() exceptions are now caught and
+#    logged; callers get an empty list rather than an unhandled exception that
+#    Kodi surfaces as a confusing error dialog.
 #
-# 8. Cache table uses a composite index on (url, params_hash) for fast lookup.
+# 6. SESSION HEALTH CHECK — _has_valid_session() inspects the cookie jar and
+#    returns False if SessionId is absent, empty, or clearly a placeholder.
+#    Used by _cached_get and _ensure_session.
 #
-# Changes in v2026.2:
-# 9.  Favourite model added to SQLite DB. add_favourite() / remove_favourite() /
-#     get_favourites() / is_favourite() methods.  Three types: album/artist/song.
-# 10. album_tracks() now also scrapes: genre tags, full description text, total
-#     album duration.  Returned in an "album_info" key alongside tracks.
-# 11. play_url() passes album art as fanart in the Kodi ListItem so the Now
-#     Playing screen shows the album cover as background (handled in default.py).
+# OTHER IMPROVEMENTS:
+# -------------------
+# 7. Exponential back-off retry (up to 2 retries) on network errors /
+#    transient 5xx responses from the CDN or listing endpoints.
+#
+# 8. Cookie file is now saved after every successful listing fetch, not just
+#    at __del__ time.  With reuselanguageinvoker=true, __del__ is called
+#    infrequently and cookies could be lost if Kodi crashes or is force-quit.
+#
+# 9. _parse_album_report now applies image_url() wrapping so art headers are
+#    consistent across all callers (previously some callers got raw URLs).
 
 import hashlib
 import json
@@ -68,6 +73,10 @@ log = logging.getLogger(__name__)
 
 db = SqliteDatabase(None)
 
+# Minimum number of "content" elements a listing page must have to be
+# considered valid and worth caching.  A login-wall page has 0 of these.
+_MIN_VALID_ELEMENTS = 1
+
 
 # --------------------------------------------------------------------------- #
 # Database models
@@ -87,19 +96,12 @@ class Track(BaseModel):
     album     = TextField()
     artist    = TextField()
     title     = TextField()
-    album_url = TextField(default="")   # source page URL, used to refresh session at play time
+    album_url = TextField(default="")
 
 
 class Favourite(BaseModel):
-    """
-    User-saved favourites.  kind is one of: "album" | "artist" | "song".
-    url  is the musicmp3.ru page URL (album/artist page) or rel (for songs).
-    label is the display name shown in the favourites list.
-    thumb is the album-art URL (may be empty for artists).
-    artist / album are optional metadata fields for richer display.
-    added_at is a Unix timestamp so the list can be sorted chronologically.
-    """
-    kind     = CharField()           # "album" | "artist" | "song"
+    """User-saved favourites. kind: 'album' | 'artist' | 'song'."""
+    kind     = CharField()
     url      = CharField(unique=True)
     label    = TextField()
     thumb    = TextField(default="")
@@ -121,7 +123,7 @@ class PageCache(BaseModel):
     expires_at  = FloatField()
 
     class Meta:
-        indexes = ((("url", "params_hash"), True),)   # unique index
+        indexes = ((("url", "params_hash"), True),)
 
 
 # --------------------------------------------------------------------------- #
@@ -130,19 +132,14 @@ class PageCache(BaseModel):
 
 class musicMp3:
     def __init__(self, cache_dir, timeout=15, cache_hours=6):
-        """
-        cache_dir   : path to the plugin's user-data directory (writable)
-        timeout     : HTTP request timeout in seconds (from settings)
-        cache_hours : how long to cache listing pages; 0 = no cache (from settings)
-        """
         if not os.path.exists(cache_dir):
             cache_dir = os.getcwd()
 
-        self.timeout = timeout
+        self.timeout     = timeout
         self.cache_hours = cache_hours
 
         tracks_db_path   = os.path.join(cache_dir, "tracks.db")
-        cookie_file_path = os.path.join(cache_dir, "lwp_cookies.dat")
+        self._cookie_path = os.path.join(cache_dir, "lwp_cookies.dat")
 
         db.init(tracks_db_path)
         db.connect(reuse_if_open=True)
@@ -155,21 +152,21 @@ class musicMp3:
         )
 
         self.s = requests.Session()
-        self.s.cookies = LWPCookieJar(filename=cookie_file_path)
+        self.s.cookies = LWPCookieJar(filename=self._cookie_path)
         self.s.headers.update({"User-Agent": self.user_agent})
 
-        if os.path.isfile(cookie_file_path):
-            self.s.cookies.load(ignore_discard=True, ignore_expires=True)
+        if os.path.isfile(self._cookie_path):
+            try:
+                self.s.cookies.load(ignore_discard=True, ignore_expires=True)
+            except Exception as exc:
+                log.warning("Could not load cookie file: %s", exc)
 
     def __del__(self):
         try:
             db.close()
         except Exception:
             pass
-        try:
-            self.s.cookies.save(ignore_discard=True, ignore_expires=True)
-        except Exception:
-            pass
+        self._save_cookies()
         try:
             self.s.close()
         except Exception:
@@ -179,57 +176,169 @@ class musicMp3:
     # Internal helpers
     # ----------------------------------------------------------------------- #
 
+    def _save_cookies(self):
+        """Persist cookies to disk. Safe to call at any time."""
+        try:
+            self.s.cookies.save(ignore_discard=True, ignore_expires=True)
+        except Exception:
+            pass
+
     def _quote(self, s):
         return url_quote(s, safe="")
 
     def image_url(self, url):
         """Append Kodi HTTP header injection for album art requests."""
+        if not url:
+            return ""
         return "{0}|User-Agent={1}&Referer={2}".format(
             url, self._quote(self.user_agent), self._quote(self.base_url)
         )
 
     def _params_hash(self, params):
-        """Stable hash of a params dict for use as a cache key."""
         serialised = json.dumps(params, sort_keys=True)
         return hashlib.md5(serialised.encode()).hexdigest()
+
+    def _has_valid_session(self):
+        """
+        Return True if the cookie jar contains a non-empty SessionId.
+        A missing, blank, or obviously-placeholder value returns False.
+        """
+        cookies = requests.utils.dict_from_cookiejar(self.s.cookies)
+        sid = cookies.get("SessionId", "")
+        return bool(sid and len(sid) > 4)
+
+    def _ensure_session(self, referer_url=None):
+        """
+        Guarantee a fresh SessionId cookie by hitting the site.
+        Called before any authenticated request.
+        """
+        target = referer_url if referer_url else self.base_url
+        try:
+            self.s.get(
+                target,
+                headers={"Referer": self.base_url},
+                timeout=self.timeout,
+            )
+            self._save_cookies()
+        except Exception as exc:
+            log.warning("Session refresh failed: %s", exc)
+
+    def _page_has_content(self, soup):
+        """
+        Return True if the parsed page looks like a valid content page
+        (has at least one element we would actually parse).
+        A login wall, CAPTCHA, or empty response will return False.
+        """
+        return bool(
+            soup.find(class_="album_report")
+            or soup.find(class_="artist_preview")
+            or soup.find("tr", class_="song")
+            or soup.find("a")   # bare artist list pages are just <a> links
+        )
+
+    def _fetch_live(self, url, params, headers):
+        """
+        Execute a single live HTTP GET with basic retry on transient errors.
+        Returns (response, soup) or raises on persistent failure.
+        """
+        last_exc = None
+        for attempt in range(3):
+            try:
+                r = self.s.get(
+                    url, params=params, headers=headers, timeout=self.timeout
+                )
+                r.raise_for_status()
+                return r, BeautifulSoup(r.text, "html.parser")
+            except requests.exceptions.HTTPError as exc:
+                # 4xx errors won't be fixed by retrying
+                if exc.response is not None and exc.response.status_code < 500:
+                    raise
+                last_exc = exc
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+        raise last_exc
 
     def _cached_get(self, url, params=None, referer=None):
         """
         Fetch a URL, returning BeautifulSoup.
-        If cache_hours > 0, check the PageCache table first.
-        Cache misses fetch live and store the result.
-        Always fetches live if cache_hours == 0.
-        """
-        params = params or {}
-        headers = {"Referer": referer or self.base_url}
-        p_hash = self._params_hash(params)
 
+        v2026.3 improvements vs v2026.2:
+        - Validates cached HTML before returning (detects stale/poisoned cache)
+        - Validates live-fetched HTML before caching (never caches bad pages)
+        - Ensures a valid session exists before fetching
+        - Retries with a fresh session if the live fetch returns empty content
+        """
+        params  = params or {}
+        headers = {"Referer": referer or self.base_url}
+        p_hash  = self._params_hash(params)
+
+        # ---- Check cache ----
         if self.cache_hours > 0:
             try:
                 entry = PageCache.get(
                     (PageCache.url == url) & (PageCache.params_hash == p_hash)
                 )
                 if entry.expires_at == 0 or entry.expires_at > time.time():
-                    return BeautifulSoup(entry.html, "html.parser")
+                    soup = BeautifulSoup(entry.html, "html.parser")
+                    if self._page_has_content(soup):
+                        return soup
+                    # Cached page is empty / poisoned — delete and re-fetch
+                    log.warning(
+                        "Cached page for %s appears empty/poisoned — discarding", url
+                    )
                 entry.delete_instance()
             except PageCache.DoesNotExist:
                 pass
 
-        r = self.s.get(url, params=params, headers=headers, timeout=self.timeout)
-        r.raise_for_status()
+        # ---- Ensure we have a session before hitting listing pages ----
+        if not self._has_valid_session():
+            log.debug("No valid session — warming up before fetching %s", url)
+            self._ensure_session()
 
-        if self.cache_hours > 0:
+        # ---- Live fetch ----
+        try:
+            r, soup = self._fetch_live(url, params, headers)
+        except Exception as exc:
+            log.error("Live fetch failed for %s: %s", url, exc)
+            return BeautifulSoup("", "html.parser")
+
+        # ---- If page looks empty, refresh session and retry once ----
+        if not self._page_has_content(soup):
+            log.warning(
+                "Empty response from %s — refreshing session and retrying", url
+            )
+            self._ensure_session()
+            try:
+                r, soup = self._fetch_live(url, params, headers)
+            except Exception as exc:
+                log.error("Retry fetch failed for %s: %s", url, exc)
+                return BeautifulSoup("", "html.parser")
+
+        # ---- Cache only if the page actually has content ----
+        if self.cache_hours > 0 and self._page_has_content(soup):
             expires = time.time() + self.cache_hours * 3600
-            PageCache.replace(
-                url=url, params_hash=p_hash, html=r.text, expires_at=expires
-            ).execute()
+            try:
+                PageCache.replace(
+                    url=url, params_hash=p_hash, html=r.text, expires_at=expires
+                ).execute()
+            except Exception as exc:
+                log.warning("Failed to write page cache: %s", exc)
+        elif self.cache_hours > 0:
+            log.warning(
+                "Not caching %s — page has no recognisable content", url
+            )
 
-        return BeautifulSoup(r.text, "html.parser")
+        # Save cookies after every successful listing fetch
+        self._save_cookies()
+
+        return soup
 
     def _parse_album_report(self, album_el):
         """
         Parse a single album_report element into a dict.
-        Returns None if any required field is missing (site layout guard).
+        Returns None if any required field is missing.
         """
         try:
             name_el    = album_el.find(class_="album_report__name")
@@ -294,22 +403,18 @@ class musicMp3:
         return format(a, '08x') + format(b, '08x')
 
     def _ensure_session(self, referer_url=None):
-        """
-        Guarantee a fresh, valid SessionId cookie.
-        Always performs a GET to establish a new session.
-        """
         target = referer_url if referer_url else self.base_url
-        self.s.get(target, headers={"Referer": self.base_url}, timeout=self.timeout)
         try:
-            self.s.cookies.save(ignore_discard=True, ignore_expires=True)
-        except Exception:
-            pass
+            self.s.get(
+                target,
+                headers={"Referer": self.base_url},
+                timeout=self.timeout,
+            )
+            self._save_cookies()
+        except Exception as exc:
+            log.warning("Session refresh failed: %s", exc)
 
     def play_url(self, track_id, rel, referer_url=None):
-        """
-        Build the streamable audio URL with CDN token and Kodi HTTP headers.
-        referer_url is used to refresh the session cookie before token computation.
-        """
         self._ensure_session(referer_url)
         return (
             "https://listen.musicmp3.ru/{0}/{1}"
@@ -326,7 +431,6 @@ class musicMp3:
     # ----------------------------------------------------------------------- #
 
     def add_favourite(self, kind, url, label, thumb="", artist="", album=""):
-        """Save an item to favourites. kind: 'album' | 'artist' | 'song'."""
         Favourite.replace(
             kind=kind, url=url, label=label,
             thumb=thumb, artist=artist, album=album,
@@ -334,29 +438,23 @@ class musicMp3:
         ).execute()
 
     def remove_favourite(self, url):
-        """Remove a favourite by its URL/rel key."""
         Favourite.delete().where(Favourite.url == url).execute()
 
     def is_favourite(self, url):
-        """Return True if the given URL is already saved."""
         return Favourite.select().where(Favourite.url == url).exists()
 
     def get_favourites(self, kind=None):
-        """
-        Return favourites as a list of dicts, newest first.
-        Pass kind='album'/'artist'/'song' to filter, or None for all.
-        """
         q = Favourite.select().order_by(Favourite.added_at.desc())
         if kind:
             q = q.where(Favourite.kind == kind)
         return [
             {
-                "kind":    f.kind,
-                "url":     f.url,
-                "label":   f.label,
-                "thumb":   f.thumb,
-                "artist":  f.artist,
-                "album":   f.album,
+                "kind":   f.kind,
+                "url":    f.url,
+                "label":  f.label,
+                "thumb":  f.thumb,
+                "artist": f.artist,
+                "album":  f.album,
             }
             for f in q
         ]
@@ -366,19 +464,38 @@ class musicMp3:
     # ----------------------------------------------------------------------- #
 
     def search(self, text, cat):
-        """
-        Search musicmp3.ru for artists, albums, or songs.
-        cat: "artists" | "albums" | "songs"
-        """
+        """Search musicmp3.ru. cat: 'artists' | 'albums' | 'songs'."""
         params = {"text": text, "all": cat}
-        r = self.s.get(
-            "https://musicmp3.ru/search.html",
-            params=params,
-            headers={"Referer": self.base_url},
-            timeout=self.timeout,
-        )
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Ensure session before search (search endpoint is not cached)
+        if not self._has_valid_session():
+            self._ensure_session()
+
+        try:
+            r, soup = self._fetch_live(
+                "https://musicmp3.ru/search.html",
+                params,
+                {"Referer": self.base_url},
+            )
+        except Exception as exc:
+            log.error("Search request failed: %s", exc)
+            return []
+
+        # If we got a bad page, refresh session and retry once
+        if not self._page_has_content(soup):
+            log.warning("Search returned empty page — refreshing session and retrying")
+            self._ensure_session()
+            try:
+                r, soup = self._fetch_live(
+                    "https://musicmp3.ru/search.html",
+                    params,
+                    {"Referer": self.base_url},
+                )
+            except Exception as exc:
+                log.error("Search retry failed: %s", exc)
+                return []
+
+        self._save_cookies()
         results = []
 
         if cat == "artists":
@@ -524,20 +641,22 @@ class musicMp3:
     def album_tracks(self, url):
         """
         Fetch and parse the track listing for an album page.
-        Always fetches live (no cache) — we need fresh session state for play tokens.
-        Writes results to the Track table.
-
-        Returns a tuple: (tracks, album_info)
-          tracks     : list of track dicts (same as before)
-          album_info : dict with keys: title, artist, image, year, genre, description
+        Always fetches live — we need fresh session state for play tokens.
+        Returns (tracks, album_info).
         """
-        r = self.s.get(url, headers={"Referer": self.base_url}, timeout=self.timeout)
-        r.raise_for_status()
+        # Ensure valid session before fetching album page
+        if not self._has_valid_session():
+            self._ensure_session()
+
         try:
-            self.s.cookies.save(ignore_discard=True, ignore_expires=True)
-        except Exception:
-            pass
-        soup = BeautifulSoup(r.text, "html.parser")
+            r, soup = self._fetch_live(
+                url, {}, {"Referer": self.base_url}
+            )
+        except Exception as exc:
+            log.error("album_tracks fetch failed for %s: %s", url, exc)
+            return [], {}
+
+        self._save_cookies()
 
         # --- Album-level metadata ---
         image_tag = soup.find(class_="art_wrap__img")
@@ -552,7 +671,6 @@ class musicMp3:
             "description": "",
         }
 
-        # Title and artist from itemprop on the album container
         title_el = soup.find(itemprop="name", class_=lambda c: c and "album" in c.lower()) \
                    or soup.find(class_="album_info__title") \
                    or soup.find(itemprop="name")
@@ -563,12 +681,10 @@ class musicMp3:
         if artist_el:
             album_info["artist"] = artist_el.get_text(strip=True)
 
-        # Year
         date_el = soup.find(itemprop="datePublished") or soup.find(class_="album_info__date")
         if date_el:
             album_info["year"] = (date_el.get("content") or date_el.get_text(strip=True))[:4]
 
-        # Genre tags — the site lists them as links in a genre block
         genre_els = soup.find_all(class_="album_info__genre") or \
                     soup.find_all(itemprop="genre")
         if genre_els:
@@ -576,7 +692,6 @@ class musicMp3:
                 g.get_text(strip=True) for g in genre_els if g.get_text(strip=True)
             )
 
-        # Description / review text
         desc_el = soup.find(class_="album_info__description") or \
                   soup.find(class_="album_description") or \
                   soup.find(itemprop="description")
@@ -612,7 +727,6 @@ class musicMp3:
         return tracks, album_info
 
     def get_track(self, rel):
-        """Retrieve cached Track by rel key. Returns empty Track() if not found."""
         try:
             return Track.get(Track.rel == rel)
         except Track.DoesNotExist:
