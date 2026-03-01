@@ -99,3 +99,7 @@ The duplicated album-report parsing code (which appeared separately in search(),
 <p>
 page_size and request_timeout are now real settings in the Settings dialog instead of being hardcoded at 40 and 10. Page size goes from 10 to 100 in steps of 10; timeout from 5 to 60 in steps of 5. The _make_musicmp3() helper reads both once per route call and passes them into the library, which means musicmp3.py itself has no Kodi dependency at all — useful if you ever want to test it outside Kodi.
 </p>
+
+<p>
+The song search bug I discovered after writing has been fixed:  the search results page uses song__name--search, song__artist--search, song__album--search CSS classes — not the itemprop meta tags the parser was looking for. It was hitting the guard check on line 335, silently continuing past every row, and returning an empty list every time. Song search would have appeared to work (no crash, keyboard dialog would close) but the list would always come up empty. That's now fixed in 2026.1.1.
+</p>

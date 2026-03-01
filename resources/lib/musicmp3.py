@@ -319,35 +319,82 @@ class musicMp3:
                     results.append(entry)
 
         elif cat == "songs":
-            # Song results appear as .song elements inside the search results page.
-            # Each has the same structure as on an album page, so we reuse the
-            # same parsing logic as album_tracks().
-            image_fallback = ""
+            # IMPORTANT: The song search results page uses a DIFFERENT HTML structure
+            # than album pages. Album pages embed metadata in <meta itemprop="...">
+            # elements. The search results page puts everything in plain <td> cells
+            # with --search modifier classes. Using itemprop lookups here will silently
+            # return None for every row and produce zero results.
+            #
+            # Confirmed by cross-referencing the original mp3streams plugin (Jon Bovi,
+            # 2025.0.1) which uses the --search class names directly in its regex.
+            #
+            # Structure (per row):
+            #   <tr class="song" id="trackNNN">
+            #     <td class="song__play_button">
+            #       <a rel="FILENAME.mp3" .../>   ← the rel attr holds the playable file
+            #     </td>
+            #     <td class="song__name song__name--search">
+            #       <a href="/album/...">TITLE</a>
+            #     </td>
+            #     <td class="song__artist song__artist--search">
+            #       <a href="/artist/...">ARTIST</a>  (or <span> for Various Artists)
+            #     </td>
+            #     <td class="song__album song__album--search">
+            #       <a href="/album/...">ALBUM</a>
+            #     </td>
+            #   </tr>
+            #
+            # Note: no duration or thumbnail is available in search results rows.
+            # duration is left empty; the Track table will fill it if the album page
+            # has been fetched previously.
             tracks = []
-            for song in soup.find_all(class_="song"):
+            for song in soup.find_all("tr", class_="song"):
                 try:
-                    name_el     = song.find(itemprop="name")
-                    artist_el   = song.find(itemprop="byArtist")
-                    album_el    = song.find(itemprop="inAlbum")
-                    duration_el = song.find(itemprop="duration")
-                    img_el      = song.find("img")
+                    play_el   = song.find("td", class_="song__play_button")
+                    name_td   = song.find("td", class_="song__name--search")
+                    artist_td = song.find("td", class_="song__artist--search")
+                    album_td  = song.find("td", class_="song__album--search")
 
-                    if not all([name_el, artist_el, album_el, duration_el, song.a]):
+                    if not all([play_el, name_td, artist_td, album_td]):
                         continue
 
-                    image = self.image_url(img_el.get("src", "")) if img_el else image_fallback
+                    play_a = play_el.find("a")
+                    if not play_a:
+                        continue
+
+                    rel      = play_a.get("rel", [""])[0] if play_a.get("rel") else ""
+                    track_id = song.get("id", "")
+
+                    # Artist may be a <span> (Various Artists) or <a> (normal)
+                    artist_el = artist_td.find(["a", "span"])
+                    artist    = artist_el.get_text(strip=True) if artist_el else ""
+
+                    name_a  = name_td.find("a")
+                    album_a = album_td.find("a")
+                    title   = name_a.get_text(strip=True)  if name_a  else name_td.get_text(strip=True)
+                    album   = album_a.get_text(strip=True) if album_a  else album_td.get_text(strip=True)
+
+                    if not rel or not track_id:
+                        continue
+
+                    # Check if we already have duration/image cached from a prior
+                    # album page fetch — avoids a blank duration in the list item.
+                    try:
+                        cached = Track.get(Track.rel == rel)
+                        duration = cached.duration
+                        image    = cached.image
+                    except Track.DoesNotExist:
+                        duration = ""
+                        image    = ""
+
                     track = {
-                        "title":    name_el.get_text(strip=True),
-                        "artist":   artist_el.get("content", ""),
-                        "album":    album_el.get("content", ""),
-                        "duration": str(
-                            isodate.parse_duration(
-                                duration_el.get("content", "PT0S")
-                            ).total_seconds()
-                        ),
+                        "title":    title,
+                        "artist":   artist,
+                        "album":    album,
+                        "duration": duration,
                         "image":    image,
-                        "track_id": song.get("id", ""),
-                        "rel":      song.a.get("rel", [""])[0],
+                        "track_id": track_id,
+                        "rel":      rel,
                     }
                     tracks.append(track)
                 except Exception as exc:
