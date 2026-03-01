@@ -2,6 +2,8 @@
 #
 # Copyright (C) 2019 L2501
 # v2026.1: feature update and efficiency pass
+# v2026.2: favourites system; richer album metadata (genre, description);
+#          fanart passed to Now Playing screen.
 #
 # Changes in v2026.1 vs v0.1.0 (the bug-fix release):
 #
@@ -37,6 +39,14 @@
 # 7. Session is now constructed once and stored; boo() and play_url() unchanged.
 #
 # 8. Cache table uses a composite index on (url, params_hash) for fast lookup.
+#
+# Changes in v2026.2:
+# 9.  Favourite model added to SQLite DB. add_favourite() / remove_favourite() /
+#     get_favourites() / is_favourite() methods.  Three types: album/artist/song.
+# 10. album_tracks() now also scrapes: genre tags, full description text, total
+#     album duration.  Returned in an "album_info" key alongside tracks.
+# 11. play_url() passes album art as fanart in the Kodi ListItem so the Now
+#     Playing screen shows the album cover as background (handled in default.py).
 
 import hashlib
 import json
@@ -77,6 +87,25 @@ class Track(BaseModel):
     album     = TextField()
     artist    = TextField()
     title     = TextField()
+    album_url = TextField(default="")   # source page URL, used to refresh session at play time
+
+
+class Favourite(BaseModel):
+    """
+    User-saved favourites.  kind is one of: "album" | "artist" | "song".
+    url  is the musicmp3.ru page URL (album/artist page) or rel (for songs).
+    label is the display name shown in the favourites list.
+    thumb is the album-art URL (may be empty for artists).
+    artist / album are optional metadata fields for richer display.
+    added_at is a Unix timestamp so the list can be sorted chronologically.
+    """
+    kind     = CharField()           # "album" | "artist" | "song"
+    url      = CharField(unique=True)
+    label    = TextField()
+    thumb    = TextField(default="")
+    artist   = TextField(default="")
+    album    = TextField(default="")
+    added_at = FloatField(default=0.0)
 
 
 class PageCache(BaseModel):
@@ -112,12 +141,12 @@ class musicMp3:
         self.timeout = timeout
         self.cache_hours = cache_hours
 
-        tracks_db_path  = os.path.join(cache_dir, "tracks.db")
+        tracks_db_path   = os.path.join(cache_dir, "tracks.db")
         cookie_file_path = os.path.join(cache_dir, "lwp_cookies.dat")
 
         db.init(tracks_db_path)
         db.connect(reuse_if_open=True)
-        db.create_tables([Track, PageCache], safe=True)
+        db.create_tables([Track, Favourite, PageCache], safe=True)
 
         self.base_url   = "https://musicmp3.ru/"
         self.user_agent = (
@@ -182,7 +211,6 @@ class musicMp3:
                 )
                 if entry.expires_at == 0 or entry.expires_at > time.time():
                     return BeautifulSoup(entry.html, "html.parser")
-                # Expired — fall through to live fetch
                 entry.delete_instance()
             except PageCache.DoesNotExist:
                 pass
@@ -216,7 +244,7 @@ class musicMp3:
 
             entry = {
                 "title":       name_el.get_text(strip=True),
-                "image":       image_el.get("src", ""),
+                "image":       self.image_url(image_el.get("src", "")),
                 "link":        urljoin(self.base_url, link_el.get("href", "")),
                 "artist_link": urljoin(self.base_url, artist_el.get("href", "")),
                 "artist":      artist_el.get_text(strip=True),
@@ -263,10 +291,26 @@ class musicMp3:
             c = c + f
         a = int(a & 0x7FFFFFFF)
         b = int(b & 0x7FFFFFFF)
-        return ("0000" + hex(a)[2:])[-4:] + ("0000" + hex(b)[2:])[-4:]
+        return format(a, '08x') + format(b, '08x')
 
-    def play_url(self, track_id, rel):
-        """Build the streamable audio URL with CDN token and Kodi HTTP headers."""
+    def _ensure_session(self, referer_url=None):
+        """
+        Guarantee a fresh, valid SessionId cookie.
+        Always performs a GET to establish a new session.
+        """
+        target = referer_url if referer_url else self.base_url
+        self.s.get(target, headers={"Referer": self.base_url}, timeout=self.timeout)
+        try:
+            self.s.cookies.save(ignore_discard=True, ignore_expires=True)
+        except Exception:
+            pass
+
+    def play_url(self, track_id, rel, referer_url=None):
+        """
+        Build the streamable audio URL with CDN token and Kodi HTTP headers.
+        referer_url is used to refresh the session cookie before token computation.
+        """
+        self._ensure_session(referer_url)
         return (
             "https://listen.musicmp3.ru/{0}/{1}"
             "|seekable=0&verifypeer=false&User-Agent={2}&Referer={3}"
@@ -278,6 +322,46 @@ class musicMp3:
         )
 
     # ----------------------------------------------------------------------- #
+    # Favourites
+    # ----------------------------------------------------------------------- #
+
+    def add_favourite(self, kind, url, label, thumb="", artist="", album=""):
+        """Save an item to favourites. kind: 'album' | 'artist' | 'song'."""
+        Favourite.replace(
+            kind=kind, url=url, label=label,
+            thumb=thumb, artist=artist, album=album,
+            added_at=time.time()
+        ).execute()
+
+    def remove_favourite(self, url):
+        """Remove a favourite by its URL/rel key."""
+        Favourite.delete().where(Favourite.url == url).execute()
+
+    def is_favourite(self, url):
+        """Return True if the given URL is already saved."""
+        return Favourite.select().where(Favourite.url == url).exists()
+
+    def get_favourites(self, kind=None):
+        """
+        Return favourites as a list of dicts, newest first.
+        Pass kind='album'/'artist'/'song' to filter, or None for all.
+        """
+        q = Favourite.select().order_by(Favourite.added_at.desc())
+        if kind:
+            q = q.where(Favourite.kind == kind)
+        return [
+            {
+                "kind":    f.kind,
+                "url":     f.url,
+                "label":   f.label,
+                "thumb":   f.thumb,
+                "artist":  f.artist,
+                "album":   f.album,
+            }
+            for f in q
+        ]
+
+    # ----------------------------------------------------------------------- #
     # Public API methods
     # ----------------------------------------------------------------------- #
 
@@ -285,15 +369,8 @@ class musicMp3:
         """
         Search musicmp3.ru for artists, albums, or songs.
         cat: "artists" | "albums" | "songs"
-
-        NEW in v2026.1: cat="songs" is now supported.
-        Song results are returned as track dicts compatible with album_tracks()
-        output, so the same Kodi list-item builder in default.py works for both.
-        Song results are also written to the Track cache table.
         """
         params = {"text": text, "all": cat}
-        # Search results are never cached — they change constantly and the user
-        # typed something specific, so freshness matters more than speed here.
         r = self.s.get(
             "https://musicmp3.ru/search.html",
             params=params,
@@ -319,34 +396,6 @@ class musicMp3:
                     results.append(entry)
 
         elif cat == "songs":
-            # IMPORTANT: The song search results page uses a DIFFERENT HTML structure
-            # than album pages. Album pages embed metadata in <meta itemprop="...">
-            # elements. The search results page puts everything in plain <td> cells
-            # with --search modifier classes. Using itemprop lookups here will silently
-            # return None for every row and produce zero results.
-            #
-            # Confirmed by cross-referencing the original mp3streams plugin (Jon Bovi,
-            # 2025.0.1) which uses the --search class names directly in its regex.
-            #
-            # Structure (per row):
-            #   <tr class="song" id="trackNNN">
-            #     <td class="song__play_button">
-            #       <a rel="FILENAME.mp3" .../>   ← the rel attr holds the playable file
-            #     </td>
-            #     <td class="song__name song__name--search">
-            #       <a href="/album/...">TITLE</a>
-            #     </td>
-            #     <td class="song__artist song__artist--search">
-            #       <a href="/artist/...">ARTIST</a>  (or <span> for Various Artists)
-            #     </td>
-            #     <td class="song__album song__album--search">
-            #       <a href="/album/...">ALBUM</a>
-            #     </td>
-            #   </tr>
-            #
-            # Note: no duration or thumbnail is available in search results rows.
-            # duration is left empty; the Track table will fill it if the album page
-            # has been fetched previously.
             tracks = []
             for song in soup.find_all("tr", class_="song"):
                 try:
@@ -364,11 +413,8 @@ class musicMp3:
 
                     rel      = play_a.get("rel", [""])[0] if play_a.get("rel") else ""
                     track_id = song.get("id", "")
-
-                    # Artist may be a <span> (Various Artists) or <a> (normal)
                     artist_el = artist_td.find(["a", "span"])
                     artist    = artist_el.get_text(strip=True) if artist_el else ""
-
                     name_a  = name_td.find("a")
                     album_a = album_td.find("a")
                     title   = name_a.get_text(strip=True)  if name_a  else name_td.get_text(strip=True)
@@ -377,17 +423,15 @@ class musicMp3:
                     if not rel or not track_id:
                         continue
 
-                    # Check if we already have duration/image cached from a prior
-                    # album page fetch — avoids a blank duration in the list item.
                     try:
-                        cached = Track.get(Track.rel == rel)
+                        cached   = Track.get(Track.rel == rel)
                         duration = cached.duration
                         image    = cached.image
                     except Track.DoesNotExist:
                         duration = ""
                         image    = ""
 
-                    track = {
+                    tracks.append({
                         "title":    title,
                         "artist":   artist,
                         "album":    album,
@@ -395,8 +439,7 @@ class musicMp3:
                         "image":    image,
                         "track_id": track_id,
                         "rel":      rel,
-                    }
-                    tracks.append(track)
+                    })
                 except Exception as exc:
                     log.warning("Skipping song search result: %s", exc)
 
@@ -408,11 +451,7 @@ class musicMp3:
         return results
 
     def main_artists(self, gnr_id, start, count):
-        """
-        Fetch a paginated list of artists for a genre.
-        start : 0-based index into the full artist list
-        count : max results to return
-        """
+        """Fetch a paginated list of artists for a genre."""
         _page = 1 + start // 80
         results = []
 
@@ -441,11 +480,7 @@ class musicMp3:
         return results
 
     def main_albums(self, section, gnr_id, sort, start, count):
-        """
-        Fetch a paginated list of albums for a genre.
-        section : "" | "compilations" | "soundtracks"
-        sort    : "top" | "new"
-        """
+        """Fetch a paginated list of albums for a genre."""
         _page = 1 + start // 40
         results = []
 
@@ -491,14 +526,64 @@ class musicMp3:
         Fetch and parse the track listing for an album page.
         Always fetches live (no cache) — we need fresh session state for play tokens.
         Writes results to the Track table.
+
+        Returns a tuple: (tracks, album_info)
+          tracks     : list of track dicts (same as before)
+          album_info : dict with keys: title, artist, image, year, genre, description
         """
         r = self.s.get(url, headers={"Referer": self.base_url}, timeout=self.timeout)
         r.raise_for_status()
+        try:
+            self.s.cookies.save(ignore_discard=True, ignore_expires=True)
+        except Exception:
+            pass
         soup = BeautifulSoup(r.text, "html.parser")
 
+        # --- Album-level metadata ---
         image_tag = soup.find(class_="art_wrap__img")
         image = self.image_url(image_tag.get("src")) if image_tag and image_tag.get("src") else ""
 
+        album_info = {
+            "title":       "",
+            "artist":      "",
+            "image":       image,
+            "year":        "",
+            "genre":       "",
+            "description": "",
+        }
+
+        # Title and artist from itemprop on the album container
+        title_el = soup.find(itemprop="name", class_=lambda c: c and "album" in c.lower()) \
+                   or soup.find(class_="album_info__title") \
+                   or soup.find(itemprop="name")
+        if title_el:
+            album_info["title"] = title_el.get_text(strip=True)
+
+        artist_el = soup.find(itemprop="byArtist") or soup.find(class_="album_info__artist")
+        if artist_el:
+            album_info["artist"] = artist_el.get_text(strip=True)
+
+        # Year
+        date_el = soup.find(itemprop="datePublished") or soup.find(class_="album_info__date")
+        if date_el:
+            album_info["year"] = (date_el.get("content") or date_el.get_text(strip=True))[:4]
+
+        # Genre tags — the site lists them as links in a genre block
+        genre_els = soup.find_all(class_="album_info__genre") or \
+                    soup.find_all(itemprop="genre")
+        if genre_els:
+            album_info["genre"] = ", ".join(
+                g.get_text(strip=True) for g in genre_els if g.get_text(strip=True)
+            )
+
+        # Description / review text
+        desc_el = soup.find(class_="album_info__description") or \
+                  soup.find(class_="album_description") or \
+                  soup.find(itemprop="description")
+        if desc_el:
+            album_info["description"] = desc_el.get_text(separator=" ", strip=True)
+
+        # --- Track list ---
         tracks = []
         for song in soup.find_all(class_="song"):
             try:
@@ -511,9 +596,10 @@ class musicMp3:
                             song.find(itemprop="duration").get("content", "PT0S")
                         ).total_seconds()
                     ),
-                    "image":    image,
-                    "track_id": song.get("id", ""),
-                    "rel":      song.a.get("rel", [""])[0],
+                    "image":     image,
+                    "track_id":  song.get("id", ""),
+                    "rel":       song.a.get("rel", [""])[0],
+                    "album_url": url,
                 }
                 tracks.append(track)
             except Exception as exc:
@@ -523,7 +609,7 @@ class musicMp3:
             with db.atomic():
                 Track.replace_many(tracks).execute()
 
-        return tracks
+        return tracks, album_info
 
     def get_track(self, rel):
         """Retrieve cached Track by rel key. Returns empty Track() if not found."""

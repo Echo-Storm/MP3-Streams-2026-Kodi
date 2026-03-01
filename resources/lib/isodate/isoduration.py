@@ -34,7 +34,7 @@ from datetime import timedelta
 from decimal import Decimal
 import re
 
-from six import string_types
+string_types = (str,)
 
 from .duration import Duration
 from .isoerror import ISO8601Error

@@ -2,32 +2,28 @@
 #
 # Copyright (C) 2019 L2501
 # v2026.1: feature update and efficiency pass
+# v2026.2: favourites system; InfoTagMusic everywhere; richer album metadata;
+#          fanart on Now Playing screen.
 #
-# Changes vs v0.1.0:
+# v2026.2 changes vs v2026.1.7:
 #
-# 1. Song search added to the main menu and musicmp3_search() route.
-#    The site always supported `all=songs` on its search endpoint but the
-#    plugin never used it. Song results play directly — no extra click.
+# 1. All setInfo("music", {...}) calls replaced with getMusicInfoTag() setters.
+#    Eliminates the "Setting most music properties through ListItem.setInfo()
+#    is deprecated" log spam introduced in Kodi 19.
 #
-# 2. "Clear Cache" menu item added to the main menu.
-#    Calls musicMp3.clear_cache() to wipe the PageCache table without
-#    touching the Track table or the cookie file.
+# 2. Favourites system:
+#    - "Favourite Albums", "Favourite Artists", "Favourite Songs" on home screen.
+#    - Context menu on albums: "Add to Favourites" / "Remove from Favourites".
+#    - Context menu on artists: "Add to Favourites" / "Remove from Favourites".
+#    - Context menu on tracks: "Add to Favourites" / "Remove from Favourites".
+#    - Stored in the SQLite DB (Favourite table in tracks.db).
+#    - Routes: /favourites/<kind>, /fav/add, /fav/remove.
 #
-# 3. page_size and request_timeout are now read from user settings rather
-#    than being hardcoded at 40 and 10. Defaults: 40 and 15.
+# 3. Album page now scrapes and surfaces: genre, description, year — set on
+#    every track ListItem so skins can display them in the Now Playing view.
 #
-# 4. musicMp3 is now instantiated once per route function (same as before),
-#    but the timeout and cache_hours are passed in from settings so the
-#    library is not responsible for reading addon settings itself.
-#    This makes musicmp3.py testable without a running Kodi.
-#
-# 5. _make_musicmp3() helper to avoid repeating the three getSetting() calls
-#    in every route function.
-#
-# 6. musicmp3_search() now routes cat="songs" to a playable track list instead
-#    of trying to show them as directory items.
-#
-# 7. Track number shown in song listing when available (tracknumber info label).
+# 4. Now Playing screen: album art passed as fanart so it fills the background
+#    while music plays (supported by most Kodi skins).
 
 import os
 import sys
@@ -50,7 +46,7 @@ except ImportError:
 # Add-on setup
 # --------------------------------------------------------------------------- #
 
-addon = xbmcaddon.Addon()
+addon  = xbmcaddon.Addon()
 plugin = Plugin()
 plugin.name = addon.getAddonInfo("name")
 
@@ -68,10 +64,6 @@ songs_view_mode  = addon.getSetting("songs_view_mode")
 
 
 def _make_musicmp3():
-    """
-    Construct a musicMp3 instance using the current user settings.
-    Centralised here so every route reads the same values without duplication.
-    """
     try:
         timeout = int(addon.getSetting("request_timeout"))
     except (ValueError, TypeError):
@@ -101,10 +93,53 @@ def _sub_genre_icon(parent_name, sub_name):
 
 
 def _set_view(content_type, view_mode):
-    """Set content type and optionally force a view mode."""
     xbmcplugin.setContent(plugin.handle, content_type)
     if fixed_view_mode:
         xbmc.executebuiltin("Container.SetViewMode({0})".format(view_mode))
+
+
+def _link_url(route_func, link):
+    return plugin.url_for(route_func) + "?link=" + quote(link, safe="")
+
+
+def _get_link():
+    return unquote(plugin.args.get("link", [""])[0])
+
+
+def _set_music_tag(li, title="", artist="", album="", year="", genre="",
+                   duration=0, tracknumber=0, description=""):
+    """Populate a ListItem MusicInfoTag using the Kodi 19+ API."""
+    tag = li.getMusicInfoTag()
+    if title:       tag.setTitle(title)
+    if artist:      tag.setArtist(artist)
+    if album:       tag.setAlbum(album)
+    if year:
+        try:        tag.setYear(int(str(year)[:4]))
+        except (ValueError, TypeError): pass
+    if genre:
+        tag.setGenres([g.strip() for g in genre.split(",")] if "," in genre else [genre])
+    if duration:
+        try:        tag.setDuration(int(float(duration)))
+        except (ValueError, TypeError): pass
+    if tracknumber: tag.setTrack(tracknumber)
+    if description: tag.setComment(description)
+
+
+def _fav_context(api, kind, url, label, thumb="", artist="", album=""):
+    """Return the right Add/Remove favourites context menu entry for this item."""
+    if api.is_favourite(url):
+        action = plugin.url_for(fav_remove) + "?url=" + quote(url, safe="")
+        return [("Remove from Favourites", "RunPlugin({0})".format(action))]
+    action = (
+        plugin.url_for(fav_add)
+        + "?kind="  + quote(kind,   safe="")
+        + "&url="   + quote(url,    safe="")
+        + "&label=" + quote(label,  safe="")
+        + "&thumb=" + quote(thumb,  safe="")
+        + "&artist="+ quote(artist, safe="")
+        + "&album=" + quote(album,  safe="")
+    )
+    return [("Add to Favourites", "RunPlugin({0})".format(action))]
 
 
 # --------------------------------------------------------------------------- #
@@ -114,35 +149,115 @@ def _set_view(content_type, view_mode):
 @plugin.route("/")
 def index():
     items = [
-        ("Artists",          plugin.url_for(musicmp3_artist_main),          os.path.join(MEDIA_DIR, "artists.jpg")),
-        ("Top Albums",       plugin.url_for(musicmp3_albums_main, "top"),    os.path.join(MEDIA_DIR, "topalbums.jpg")),
-        ("New Albums",       plugin.url_for(musicmp3_albums_main, "new"),    os.path.join(MEDIA_DIR, "newalbums.jpg")),
-        ("Search Artists",   plugin.url_for(musicmp3_search, "artists"),     os.path.join(MEDIA_DIR, "searchartists.jpg")),
-        ("Search Albums",    plugin.url_for(musicmp3_search, "albums"),      os.path.join(MEDIA_DIR, "searchalbums.jpg")),
-        # NEW: search for individual songs and play them directly
-        ("Search Songs",     plugin.url_for(musicmp3_search, "songs"),       os.path.join(MEDIA_DIR, "searchsongs.jpg")),
-        # NEW: wipe cached listing pages (does not affect playback or the track DB)
-        ("Clear Page Cache", plugin.url_for(musicmp3_clear_cache),           os.path.join(MEDIA_DIR, "clearplaylist.jpg")),
+        ("Artists",           plugin.url_for(musicmp3_artist_main),          os.path.join(MEDIA_DIR, "artists.jpg")),
+        ("Top Albums",        plugin.url_for(musicmp3_albums_main, "top"),    os.path.join(MEDIA_DIR, "topalbums.jpg")),
+        ("New Albums",        plugin.url_for(musicmp3_albums_main, "new"),    os.path.join(MEDIA_DIR, "newalbums.jpg")),
+        ("Favourite Albums",  plugin.url_for(favourites, "album"),            os.path.join(MEDIA_DIR, "favouritealbums.jpg")),
+        ("Favourite Artists", plugin.url_for(favourites, "artist"),           os.path.join(MEDIA_DIR, "favouriteartists.jpg")),
+        ("Favourite Songs",   plugin.url_for(favourites, "song"),             os.path.join(MEDIA_DIR, "favouritesongs.jpg")),
+        ("Search Artists",    plugin.url_for(musicmp3_search, "artists"),     os.path.join(MEDIA_DIR, "searchartists.jpg")),
+        ("Search Albums",     plugin.url_for(musicmp3_search, "albums"),      os.path.join(MEDIA_DIR, "searchalbums.jpg")),
+        ("Search Songs",      plugin.url_for(musicmp3_search, "songs"),       os.path.join(MEDIA_DIR, "searchsongs.jpg")),
+        ("Clear Page Cache",  plugin.url_for(musicmp3_clear_cache),           os.path.join(MEDIA_DIR, "clearplaylist.jpg")),
     ]
     for label, url, icon in items:
         li = xbmcgui.ListItem(label)
         li.setArt({"fanart": FANART, "icon": icon})
         xbmcplugin.addDirectoryItem(plugin.handle, url, li, True)
-
     xbmcplugin.endOfDirectory(plugin.handle)
 
 
+# --------------------------------------------------------------------------- #
+# Favourites
+# --------------------------------------------------------------------------- #
+
+@plugin.route("/favourites/<kind>")
+def favourites(kind):
+    """Browse saved favourites. kind: album | artist | song."""
+    api   = _make_musicmp3()
+    items = api.get_favourites(kind=kind)
+
+    if not items:
+        xbmcgui.Dialog().notification(
+            plugin.name, "No favourites saved yet.", xbmcgui.NOTIFICATION_INFO, 3000
+        )
+        xbmcplugin.endOfDirectory(plugin.handle, succeeded=True)
+        return
+
+    directory_items = []
+    for f in items:
+        li = xbmcgui.ListItem(f["label"])
+        li.setArt({"thumb": f["thumb"], "icon": f["thumb"], "fanart": FANART})
+        _set_music_tag(li, title=f["label"], artist=f["artist"], album=f["album"])
+        remove_url = plugin.url_for(fav_remove) + "?url=" + quote(f["url"], safe="")
+        li.addContextMenuItems([
+            ("Remove from Favourites", "RunPlugin({0})".format(remove_url))
+        ])
+
+        if kind == "album":
+            directory_items.append((_link_url(musicmp3_album, f["url"]), li, True))
+        elif kind == "artist":
+            directory_items.append((_link_url(artists_albums, f["url"]), li, True))
+        elif kind == "song":
+            track = api.get_track(f["url"])   # f["url"] is the rel key for songs
+            li.setProperty("IsPlayable", "true")
+            play_qs = (
+                "?track_id="  + quote(track.track_id  or "", safe="")
+                + "&rel="     + quote(f["url"],              safe="")
+                + "&album_url="+ quote(track.album_url or "", safe="")
+            )
+            directory_items.append((plugin.url_for(musicmp3_play) + play_qs, li, False))
+
+    xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
+    _set_view("songs" if kind == "song" else "albums",
+              songs_view_mode if kind == "song" else albums_view_mode)
+    xbmcplugin.endOfDirectory(plugin.handle)
+
+
+@plugin.route("/fav/add")
+def fav_add():
+    kind   = unquote(plugin.args.get("kind",   [""])[0])
+    url    = unquote(plugin.args.get("url",    [""])[0])
+    label  = unquote(plugin.args.get("label",  [""])[0])
+    thumb  = unquote(plugin.args.get("thumb",  [""])[0])
+    artist = unquote(plugin.args.get("artist", [""])[0])
+    album  = unquote(plugin.args.get("album",  [""])[0])
+    api = _make_musicmp3()
+    api.add_favourite(kind, url, label, thumb=thumb, artist=artist, album=album)
+    xbmcgui.Dialog().notification(
+        plugin.name, u"\u2665  Added: {0}".format(label),
+        xbmcgui.NOTIFICATION_INFO, 2500
+    )
+
+
+@plugin.route("/fav/remove")
+def fav_remove():
+    url = unquote(plugin.args.get("url", [""])[0])
+    api = _make_musicmp3()
+    api.remove_favourite(url)
+    xbmcgui.Dialog().notification(
+        plugin.name, "Removed from Favourites.", xbmcgui.NOTIFICATION_INFO, 2000
+    )
+    xbmc.executebuiltin("Container.Refresh")
+
+
+# --------------------------------------------------------------------------- #
+# Utility
+# --------------------------------------------------------------------------- #
+
 @plugin.route("/musicmp3/clear_cache")
 def musicmp3_clear_cache():
-    """Wipe the page HTML cache. Tracks and cookies are untouched."""
     api = _make_musicmp3()
     api.clear_cache()
     xbmcgui.Dialog().notification(
         plugin.name, "Page cache cleared.", xbmcgui.NOTIFICATION_INFO, 3000
     )
-    # Re-open the home screen so the user sees we're done
     xbmc.executebuiltin("Container.Refresh")
 
+
+# --------------------------------------------------------------------------- #
+# Genre / artist browse
+# --------------------------------------------------------------------------- #
 
 @plugin.route("/musicmp3/albums_main/<sort>")
 def musicmp3_albums_main(sort):
@@ -151,7 +266,6 @@ def musicmp3_albums_main(sort):
         li = xbmcgui.ListItem("{0} {1} Albums".format(sort.title(), gnr[0]))
         li.setArt({"fanart": FANART, "icon": _genre_icon(gnr[0])})
         directory_items.append((plugin.url_for(musicmp3_albums_gnr, sort, i), li, True))
-
     xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
     xbmcplugin.endOfDirectory(plugin.handle)
 
@@ -159,19 +273,16 @@ def musicmp3_albums_main(sort):
 @plugin.route("/musicmp3/albums_gnr/<sort>/<gnr>")
 def musicmp3_albums_gnr(sort, gnr):
     gnr_index = int(gnr)
-    parent = gnr_ids[gnr_index]
+    parent    = gnr_ids[gnr_index]
     directory_items = []
-
     for sub_gnr in parent[1]:
         section = "compilations" if sub_gnr[0] == "Compilations" else \
                   "soundtracks"  if sub_gnr[0] == "Soundtracks"  else "main"
-
         li = xbmcgui.ListItem("{0} {1} Albums".format(sort.title(), sub_gnr[0]))
         li.setArt({"fanart": FANART, "icon": _sub_genre_icon(parent[0], sub_gnr[0])})
         directory_items.append(
             (plugin.url_for(musicmp3_main_albums, section, sub_gnr[1], sort, "0"), li, True)
         )
-
     xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
     xbmcplugin.endOfDirectory(plugin.handle)
 
@@ -183,7 +294,6 @@ def musicmp3_artist_main():
         li = xbmcgui.ListItem("{0} Artists".format(gnr[0]))
         li.setArt({"fanart": FANART, "icon": _genre_icon(gnr[0])})
         directory_items.append((plugin.url_for(musicmp3_artists_gnr, i), li, True))
-
     xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
     xbmcplugin.endOfDirectory(plugin.handle)
 
@@ -191,9 +301,8 @@ def musicmp3_artist_main():
 @plugin.route("/musicmp3/artists_gnr/<gnr>")
 def musicmp3_artists_gnr(gnr):
     gnr_index = int(gnr)
-    parent = gnr_ids[gnr_index]
+    parent    = gnr_ids[gnr_index]
     directory_items = []
-
     for sub_gnr in parent[1]:
         if sub_gnr[0] in ("Compilations", "Soundtracks"):
             continue
@@ -202,86 +311,13 @@ def musicmp3_artists_gnr(gnr):
         directory_items.append(
             (plugin.url_for(musicmp3_main_artists, sub_gnr[1], "0"), li, True)
         )
-
     xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
     xbmcplugin.endOfDirectory(plugin.handle)
 
 
-@plugin.route("/musicmp3/search/<cat>")
-def musicmp3_search(cat):
-    """
-    Unified search for artists, albums, or songs.
-    - artists → directory of artist pages
-    - albums  → directory of album pages
-    - songs   → playable track list (NEW in v2026.1)
-    """
-    keyboardinput = ""
-    keyboard = xbmc.Keyboard("", "Search")
-    keyboard.doModal()
-    if keyboard.isConfirmed():
-        keyboardinput = keyboard.getText().strip()
-
-    if not keyboardinput:
-        xbmcplugin.endOfDirectory(plugin.handle, succeeded=False)
-        return
-
-    api = _make_musicmp3()
-    results = api.search(keyboardinput, cat)
-    directory_items = []
-
-    if cat == "artists":
-        for a in results:
-            li = xbmcgui.ListItem(a.get("artist", ""))
-            li.setInfo("music", {"title": a.get("artist", ""), "artist": a.get("artist", "")})
-            directory_items.append((plugin.url_for(artists_albums, quote(a.get("link", ""))), li, True))
-
-        xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
-        _set_view("albums", albums_view_mode)
-        xbmcplugin.endOfDirectory(plugin.handle)
-
-    elif cat == "albums":
-        for a in results:
-            li = xbmcgui.ListItem(
-                "{0}[CR][COLOR=darkmagenta]{1}[/COLOR]".format(a.get("title", ""), a.get("artist", ""))
-            )
-            li.setArt({"thumb": a.get("image", ""), "icon": a.get("image", "")})
-            li.setInfo("music", {
-                "title":  a.get("title", ""),
-                "artist": a.get("artist", ""),
-                "album":  a.get("title", ""),
-                "year":   a.get("date", ""),
-            })
-            li.setProperty("Album_Description", a.get("details", ""))
-            directory_items.append((plugin.url_for(musicmp3_album, quote(a.get("link", ""))), li, True))
-
-        xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
-        _set_view("albums", albums_view_mode)
-        xbmcplugin.endOfDirectory(plugin.handle)
-
-    elif cat == "songs":
-        # Song results are playable immediately — no album page click required.
-        for t in results:
-            li = xbmcgui.ListItem(t.get("title", ""))
-            li.setProperty("IsPlayable", "true")
-            li.setArt({"thumb": t.get("image", ""), "icon": t.get("image", "")})
-            li.setInfo("music", {
-                "title":    t.get("title", ""),
-                "artist":   t.get("artist", ""),
-                "album":    t.get("album", ""),
-                "duration": t.get("duration", ""),
-            })
-            directory_items.append(
-                (plugin.url_for(musicmp3_play, track_id=t.get("track_id", ""), rel=t.get("rel", "")), li, False)
-            )
-
-        xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
-        _set_view("songs", songs_view_mode)
-        xbmcplugin.endOfDirectory(plugin.handle)
-
-
 @plugin.route("/musicmp3/main_albums/<section>/<gnr_id>/<sort>/<index>/dir")
 def musicmp3_main_albums(section, gnr_id, sort, index):
-    api = _make_musicmp3()
+    api   = _make_musicmp3()
     count = _page_size()
     index = int(index)
     _section = "" if section == "main" else section
@@ -290,17 +326,16 @@ def musicmp3_main_albums(section, gnr_id, sort, index):
     directory_items = []
 
     for a in albums:
-        li = xbmcgui.ListItem(
-            "{0}[CR][COLOR=darkmagenta]{1}[/COLOR]".format(a.get("title", ""), a.get("artist", ""))
-        )
-        li.setArt({"thumb": a.get("image", ""), "icon": a.get("image", "")})
-        li.setInfo("music", {
-            "title":  a.get("title", ""),
-            "artist": a.get("artist", ""),
-            "album":  a.get("title", ""),
-            "year":   a.get("date", ""),
-        })
-        directory_items.append((plugin.url_for(musicmp3_album, quote(a.get("link", ""))), li, True))
+        li = xbmcgui.ListItem(a.get("title", ""))
+        li.setArt({"thumb": a.get("image", ""), "icon": a.get("image", ""), "fanart": FANART})
+        _set_music_tag(li,
+            title=a.get("title", ""), artist=a.get("artist", ""),
+            album=a.get("title", ""), year=a.get("date", ""))
+        li.addContextMenuItems(_fav_context(
+            api, "album", a.get("link", ""), a.get("title", ""),
+            thumb=a.get("image", ""), artist=a.get("artist", "")
+        ))
+        directory_items.append((_link_url(musicmp3_album, a.get("link", "")), li, True))
 
     if len(albums) >= count:
         next_index = str(index + count)
@@ -316,7 +351,7 @@ def musicmp3_main_albums(section, gnr_id, sort, index):
 
 @plugin.route("/musicmp3/main_artists/<gnr_id>/<index>/dir")
 def musicmp3_main_artists(gnr_id, index):
-    api = _make_musicmp3()
+    api   = _make_musicmp3()
     count = _page_size()
     index = int(index)
 
@@ -325,9 +360,12 @@ def musicmp3_main_artists(gnr_id, index):
 
     for a in artists:
         li = xbmcgui.ListItem(a.get("artist", ""))
-        li.setInfo("music", {"title": a.get("artist", ""), "artist": a.get("artist", "")})
-        li.setProperty("Album_Artist", a.get("artist", ""))
-        directory_items.append((plugin.url_for(artists_albums, quote(a.get("link", ""))), li, True))
+        li.setArt({"fanart": FANART})
+        _set_music_tag(li, title=a.get("artist", ""), artist=a.get("artist", ""))
+        li.addContextMenuItems(_fav_context(
+            api, "artist", a.get("link", ""), a.get("artist", "")
+        ))
+        directory_items.append((_link_url(artists_albums, a.get("link", "")), li, True))
 
     if len(artists) >= count:
         next_index = str(index + count)
@@ -341,76 +379,176 @@ def musicmp3_main_artists(gnr_id, index):
     xbmcplugin.endOfDirectory(plugin.handle)
 
 
-@plugin.route("/musicmp3/artists_albums/<link>")
-def artists_albums(link):
-    api = _make_musicmp3()
-    url = unquote(link)
+@plugin.route("/musicmp3/artists_albums")
+def artists_albums():
+    api    = _make_musicmp3()
+    url    = _get_link()
     albums = api.artist_albums(url)
     directory_items = []
 
     for a in albums:
-        li = xbmcgui.ListItem(
-            "{0}[CR][COLOR=darkmagenta]{1}[/COLOR]".format(a.get("title", ""), a.get("artist", ""))
-        )
-        li.setArt({"thumb": a.get("image", ""), "icon": a.get("image", "")})
-        li.setInfo("music", {
-            "title":  a.get("title", ""),
-            "artist": a.get("artist", ""),
-            "album":  a.get("title", ""),
-            "year":   a.get("date", ""),
-        })
-        li.setProperty("Album_Description", a.get("details", ""))
-        directory_items.append((plugin.url_for(musicmp3_album, quote(a.get("link", ""))), li, True))
+        li = xbmcgui.ListItem(a.get("title", ""))
+        li.setArt({"thumb": a.get("image", ""), "icon": a.get("image", ""), "fanart": FANART})
+        _set_music_tag(li,
+            title=a.get("title", ""), artist=a.get("artist", ""),
+            album=a.get("title", ""), year=a.get("date", ""),
+            description=a.get("details", ""))
+        li.addContextMenuItems(_fav_context(
+            api, "album", a.get("link", ""), a.get("title", ""),
+            thumb=a.get("image", ""), artist=a.get("artist", "")
+        ))
+        directory_items.append((_link_url(musicmp3_album, a.get("link", "")), li, True))
 
     xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
     _set_view("albums", albums_view_mode)
     xbmcplugin.endOfDirectory(plugin.handle)
 
 
-@plugin.route("/musicmp3/album/<link>")
-def musicmp3_album(link):
-    api = _make_musicmp3()
-    url = unquote(link)
-    tracks = api.album_tracks(url)
+# --------------------------------------------------------------------------- #
+# Search
+# --------------------------------------------------------------------------- #
+
+@plugin.route("/musicmp3/search/<cat>")
+def musicmp3_search(cat):
+    keyboardinput = ""
+    keyboard = xbmc.Keyboard("", "Search")
+    keyboard.doModal()
+    if keyboard.isConfirmed():
+        keyboardinput = keyboard.getText().strip()
+
+    if not keyboardinput:
+        xbmcplugin.endOfDirectory(plugin.handle, succeeded=False)
+        return
+
+    api     = _make_musicmp3()
+    results = api.search(keyboardinput, cat)
     directory_items = []
 
+    if cat == "artists":
+        for a in results:
+            li = xbmcgui.ListItem(a.get("artist", ""))
+            li.setArt({"fanart": FANART})
+            _set_music_tag(li, title=a.get("artist", ""), artist=a.get("artist", ""))
+            li.addContextMenuItems(_fav_context(
+                api, "artist", a.get("link", ""), a.get("artist", "")
+            ))
+            directory_items.append((_link_url(artists_albums, a.get("link", "")), li, True))
+        xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
+        _set_view("albums", albums_view_mode)
+        xbmcplugin.endOfDirectory(plugin.handle)
+
+    elif cat == "albums":
+        for a in results:
+            li = xbmcgui.ListItem(a.get("title", ""))
+            li.setArt({"thumb": a.get("image", ""), "icon": a.get("image", ""), "fanart": FANART})
+            _set_music_tag(li,
+                title=a.get("title", ""), artist=a.get("artist", ""),
+                album=a.get("title", ""), year=a.get("date", ""),
+                description=a.get("details", ""))
+            li.addContextMenuItems(_fav_context(
+                api, "album", a.get("link", ""), a.get("title", ""),
+                thumb=a.get("image", ""), artist=a.get("artist", "")
+            ))
+            directory_items.append((_link_url(musicmp3_album, a.get("link", "")), li, True))
+        xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
+        _set_view("albums", albums_view_mode)
+        xbmcplugin.endOfDirectory(plugin.handle)
+
+    elif cat == "songs":
+        for t in results:
+            li = xbmcgui.ListItem(t.get("title", ""))
+            li.setProperty("IsPlayable", "true")
+            li.setArt({"thumb": t.get("image", ""), "icon": t.get("image", "")})
+            _set_music_tag(li,
+                title=t.get("title", ""), artist=t.get("artist", ""),
+                album=t.get("album", ""), duration=t.get("duration", 0))
+            li.addContextMenuItems(_fav_context(
+                api, "song", t.get("rel", ""), t.get("title", ""),
+                thumb=t.get("image", ""), artist=t.get("artist", ""),
+                album=t.get("album", "")
+            ))
+            play_qs = (
+                "?track_id=" + quote(t.get("track_id", ""), safe="")
+                + "&rel="    + quote(t.get("rel", ""),      safe="")
+            )
+            directory_items.append((plugin.url_for(musicmp3_play) + play_qs, li, False))
+        xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
+        _set_view("songs", songs_view_mode)
+        xbmcplugin.endOfDirectory(plugin.handle)
+
+
+# --------------------------------------------------------------------------- #
+# Album track listing
+# --------------------------------------------------------------------------- #
+
+@plugin.route("/musicmp3/album")
+def musicmp3_album():
+    api  = _make_musicmp3()
+    url  = _get_link()
+    tracks, album_info = api.album_tracks(url)
+
+    ai_title  = album_info.get("title",  "")
+    ai_artist = album_info.get("artist", "")
+    ai_image  = album_info.get("image",  "")
+    ai_year   = album_info.get("year",   "")
+    ai_genre  = album_info.get("genre",  "")
+    ai_desc   = album_info.get("description", "")
+
+    directory_items = []
     for i, t in enumerate(tracks, 1):
-        li = xbmcgui.ListItem(t.get("title", ""))
+        art = t.get("image", "") or ai_image
+        li  = xbmcgui.ListItem(t.get("title", ""))
         li.setProperty("IsPlayable", "true")
-        li.setArt({"thumb": t.get("image", ""), "icon": t.get("image", "")})
-        li.setInfo("music", {
-            "title":       t.get("title", ""),
-            "artist":      t.get("artist", ""),
-            "album":       t.get("album", ""),
-            "duration":    t.get("duration", ""),
-            "tracknumber": i,          # site doesn't provide track numbers,
-                                       # so we use position in the parsed list
-        })
-        directory_items.append(
-            (plugin.url_for(musicmp3_play, track_id=t.get("track_id", ""), rel=t.get("rel", "")), li, False)
+        li.setArt({"thumb": art, "icon": art, "fanart": art})
+        _set_music_tag(li,
+            title=t.get("title", ""),
+            artist=t.get("artist", "") or ai_artist,
+            album=t.get("album",  "") or ai_title,
+            year=ai_year, genre=ai_genre, description=ai_desc,
+            duration=t.get("duration", 0), tracknumber=i)
+        li.addContextMenuItems(_fav_context(
+            api, "song", t.get("rel", ""), t.get("title", ""),
+            thumb=art,
+            artist=t.get("artist", "") or ai_artist,
+            album=t.get("album",  "") or ai_title
+        ))
+        play_qs = (
+            "?track_id="  + quote(t.get("track_id",  ""), safe="")
+            + "&rel="     + quote(t.get("rel",        ""), safe="")
+            + "&album_url="+ quote(t.get("album_url", ""), safe="")
         )
+        directory_items.append((plugin.url_for(musicmp3_play) + play_qs, li, False))
 
     xbmcplugin.addDirectoryItems(plugin.handle, directory_items, len(directory_items))
     _set_view("songs", songs_view_mode)
     xbmcplugin.endOfDirectory(plugin.handle)
 
 
-@plugin.route("/musicmp3/play/<track_id>/<rel>")
-def musicmp3_play(track_id, rel):
-    api = _make_musicmp3()
-    _track = api.get_track(rel)
-    play_url = api.play_url(track_id, rel)
+# --------------------------------------------------------------------------- #
+# Playback
+# --------------------------------------------------------------------------- #
 
-    li = xbmcgui.ListItem(_track.title or "", path=play_url)
-    li.setInfo("music", {
-        "title":    _track.title,
-        "artist":   _track.artist,
-        "album":    _track.album,
-        "duration": _track.duration,
-    })
-    li.setArt({"thumb": _track.image, "icon": _track.image})
+@plugin.route("/musicmp3/play")
+def musicmp3_play():
+    track_id  = unquote(plugin.args.get("track_id",   [""])[0])
+    rel       = unquote(plugin.args.get("rel",         [""])[0])
+    album_url = unquote(plugin.args.get("album_url",   [""])[0])
+
+    api    = _make_musicmp3()
+    _track = api.get_track(rel)
+    url    = api.play_url(track_id, rel, referer_url=album_url or None)
+
+    art = _track.image or ""
+    li  = xbmcgui.ListItem(_track.title or "", path=url)
+    # Fanart = album art fills the Now Playing background in most Kodi skins
+    li.setArt({"thumb": art, "icon": art, "fanart": art})
     li.setMimeType("audio/mpeg")
     li.setContentLookup(False)
+    _set_music_tag(li,
+        title=_track.title    or "",
+        artist=_track.artist  or "",
+        album=_track.album    or "",
+        duration=_track.duration or 0)
     xbmcplugin.setResolvedUrl(plugin.handle, True, li)
 
 
