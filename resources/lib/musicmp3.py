@@ -227,16 +227,37 @@ class musicMp3:
 
     def _page_has_content(self, soup):
         """
-        Return True if the parsed page looks like a valid content page
-        (has at least one element we would actually parse).
-        A login wall, CAPTCHA, or empty response will return False.
+        Return True if the parsed page looks like a valid content page.
+
+        Each check targets a CSS class or link pattern that only appears on
+        real content pages — never on login walls, captcha pages, or redirects.
+
+        Deliberately does NOT use soup.find("a") as a fallback: login walls
+        always contain anchor tags (nav links, "login here", etc.) so that
+        check would pass for any bad page and defeat poison detection entirely.
+
+        Valid signals by page type:
+          album_report        — genre/artist album grids, search album results
+          artist_preview      — search artist results
+          tr.song             — song rows (search songs, album tracks)
+          a[href*=/artist/]   — main_artists listing pages (bare <a> links
+                                whose href contains /artist/ — login walls
+                                never link to /artist/ paths)
+          a[href*=/album/]    — album links on artist pages
         """
-        return bool(
-            soup.find(class_="album_report")
-            or soup.find(class_="artist_preview")
-            or soup.find("tr", class_="song")
-            or soup.find("a")   # bare artist list pages are just <a> links
-        )
+        if soup.find(class_="album_report"):
+            return True
+        if soup.find(class_="artist_preview"):
+            return True
+        if soup.find("tr", class_="song"):
+            return True
+        # Artist listing pages: links whose href contains /artist/ or /album/
+        # These are never present on login/error pages.
+        if soup.find("a", href=lambda h: h and "/artist/" in h):
+            return True
+        if soup.find("a", href=lambda h: h and "/album/" in h):
+            return True
+        return False
 
     def _fetch_live(self, url, params, headers):
         """
@@ -294,10 +315,12 @@ class musicMp3:
             except PageCache.DoesNotExist:
                 pass
 
-        # ---- Ensure we have a session before hitting listing pages ----
-        if not self._has_valid_session():
-            log.debug("No valid session — warming up before fetching %s", url)
-            self._ensure_session()
+        # ---- Always refresh session before hitting listing pages ----
+        # We do this unconditionally rather than only when the cookie looks
+        # absent. A cookie can exist but be stale/rejected by the server —
+        # _has_valid_session() can't detect that. The warmup GET is a single
+        # cheap request that guarantees a fresh SessionId every time.
+        self._ensure_session()
 
         # ---- Live fetch ----
         try:
@@ -341,16 +364,42 @@ class musicMp3:
         """
         Parse a single album_report element into a dict.
         Returns None if any required field is missing.
+
+        HTML structure on musicmp3.ru:
+          <li class="unstyled">          ← parent / search scope
+            <div class="album_report">   ← album_el (our entry point)
+              <img class="album_report__image">
+              <a   class="album_report__link">
+                <span class="album_report__name">Title</span>
+              </a>
+            </div>
+            <a    class="album_report__artist">Artist</a>   ← SIBLING
+            <span class="album_report__date">2023</span>    ← SIBLING
+            <div  class="album_report__details_content">…</div>  ← SIBLING
+          </li>
+
+        artist/date/details live outside the album_report div, so we must
+        search the parent element to find them. We fall back to searching
+        album_el itself in case the site ever flattens the structure.
         """
         try:
-            name_el    = album_el.find(class_="album_report__name")
-            image_el   = album_el.find(class_="album_report__image")
-            link_el    = album_el.find(class_="album_report__link")
-            artist_el  = album_el.find(class_="album_report__artist")
-            date_el    = album_el.find(class_="album_report__date")
+            # Prefer to search the parent so we catch sibling elements.
+            # Fall back to album_el if there is no parent (shouldn't happen).
+            scope = album_el.parent if album_el.parent else album_el
+
+            name_el   = album_el.find(class_="album_report__name")
+            image_el  = album_el.find(class_="album_report__image")
+            link_el   = album_el.find(class_="album_report__link")
+            artist_el = scope.find(class_="album_report__artist")
+            date_el   = scope.find(class_="album_report__date")
 
             if not all([name_el, image_el, link_el, artist_el, date_el]):
-                log.warning("album_report element missing expected fields — skipping")
+                # Log which fields are missing to aid future debugging
+                missing = [n for n, el in [
+                    ("name", name_el), ("image", image_el), ("link", link_el),
+                    ("artist", artist_el), ("date", date_el),
+                ] if not el]
+                log.warning("album_report missing fields %s — skipping", missing)
                 return None
 
             entry = {
@@ -362,7 +411,7 @@ class musicMp3:
                 "date":        date_el.get_text(strip=True),
                 "details":     "",
             }
-            details_el = album_el.find(class_="album_report__details_content")
+            details_el = scope.find(class_="album_report__details_content")
             if details_el:
                 entry["details"] = details_el.get_text(strip=True)
             return entry
@@ -469,9 +518,8 @@ class musicMp3:
         """Search musicmp3.ru. cat: 'artists' | 'albums' | 'songs'."""
         params = {"text": text, "all": cat}
 
-        # Ensure session before search (search endpoint is not cached)
-        if not self._has_valid_session():
-            self._ensure_session()
+        # Always refresh session before search — stale session returns empty page
+        self._ensure_session()
 
         try:
             r, soup = self._fetch_live(
@@ -582,7 +630,7 @@ class musicMp3:
             soup = self._cached_get(
                 "https://musicmp3.ru/main_artists.html", params=params
             )
-            if not soup.a:
+            if not self._page_has_content(soup):
                 break
 
             page_offset = (_page - 1) * 80
@@ -646,9 +694,8 @@ class musicMp3:
         Always fetches live — we need fresh session state for play tokens.
         Returns (tracks, album_info).
         """
-        # Ensure valid session before fetching album page
-        if not self._has_valid_session():
-            self._ensure_session()
+        # Always refresh session before fetching album page
+        self._ensure_session()
 
         try:
             r, soup = self._fetch_live(
