@@ -486,6 +486,7 @@ def musicmp3_main_albums(section, gnr_id, sort, index):
 
     for a in albums:
         li = xbmcgui.ListItem(a.get("title", ""))
+        li.setLabel2(a.get("artist", ""))
         li.setArt({"thumb": a.get("image", ""), "icon": a.get("image", ""), "fanart": FANART})
         _set_music_tag(li,
             title=a.get("title", ""), artist=a.get("artist", ""),
@@ -560,6 +561,7 @@ def artists_albums():
 
     for a in albums:
         li = xbmcgui.ListItem(a.get("title", ""))
+        li.setLabel2(a.get("artist", ""))
         li.setArt({"thumb": a.get("image", ""), "icon": a.get("image", ""), "fanart": FANART})
         _set_music_tag(li,
             title=a.get("title", ""), artist=a.get("artist", ""),
@@ -624,6 +626,7 @@ def musicmp3_search(cat):
     elif cat == "albums":
         for a in results:
             li = xbmcgui.ListItem(a.get("title", ""))
+            li.setLabel2(a.get("artist", ""))
             li.setArt({"thumb": a.get("image", ""), "icon": a.get("image", ""), "fanart": FANART})
             _set_music_tag(li,
                 title=a.get("title", ""), artist=a.get("artist", ""),
